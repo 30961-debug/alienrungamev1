@@ -1,0 +1,1826 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Alien Dash — Corrida Alienígena Retro</title>
+<meta name="description" content="Alien Dash: um jogo retro auto-runner em pixel art com alienzinho, dinossauros, poderes e loja de skins!">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a1a;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    overflow: hidden;
+    font-family: 'Press Start 2P', monospace;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    border: 3px solid #2a2a4a;
+    box-shadow: 0 0 40px rgba(80, 60, 200, 0.3), 0 0 80px rgba(80, 60, 200, 0.1);
+    max-width: 100vw;
+    max-height: 100vh;
+    cursor: default;
+  }
+</style>
+</head>
+<body>
+<canvas id="gc"></canvas>
+<script>
+'use strict';
+
+// ============================================================
+//  CONFIGURAÇÃO E CONSTANTES
+// ============================================================
+const CVS = document.getElementById('gc');
+const CTX = CVS.getContext('2d');
+const W = 800, H = 450;
+CVS.width = W; CVS.height = H;
+CTX.imageSmoothingEnabled = false;
+
+const GROUND_Y = 370;       // Nível do chão
+const GRAVITY = 0.55;       // Gravidade
+const JUMP_VEL = -11.5;     // Velocidade do pulo
+const PX = 3;               // Escala de pixel art
+const PLAYER_X = 120;       // Posição fixa do jogador na tela
+const DAY_NIGHT_INTERVAL = 1000; // Pontos para alternar dia/noite
+
+// Tipos de poder
+const PWR_NONE = 0, PWR_ICE = 1, PWR_FIRE = 2, PWR_EARTH = 3;
+const PWR_NAMES = ['Normal', 'Gelo', 'Fogo', 'Terra'];
+const PWR_COLORS = ['#aaeeff', '#44ddff', '#ff6622', '#aa7733'];
+const PWR_SHOTS = 15; // Tiros por power-up
+
+// ============================================================
+//  SISTEMA DE SAVE / LOAD (localStorage)
+// ============================================================
+const SAVE_KEY = 'alienDashSave_v2';
+
+function loadSave() {
+  try {
+    const d = JSON.parse(localStorage.getItem(SAVE_KEY));
+    if (d) return d;
+  } catch(e) {}
+  return { highScore: 0, coins: 0, purchased: ['green'], equipped: 'green', accessory: null, purchasedAcc: [] };
+}
+
+function writeSave() {
+  localStorage.setItem(SAVE_KEY, JSON.stringify(save));
+}
+
+let save = loadSave();
+
+// ============================================================
+//  DEFINIÇÕES DA LOJA
+// ============================================================
+const SKIN_DEFS = {
+  green:  { name: 'Verde',   price: 0,   skin: '#33cc55', skinDk: '#22aa44', antenna: '#22aa44' },
+  blue:   { name: 'Azul',    price: 40,  skin: '#4488ff', skinDk: '#3366cc', antenna: '#3366cc' },
+  pink:   { name: 'Rosa',    price: 60,  skin: '#ff66aa', skinDk: '#cc4488', antenna: '#cc4488' },
+  purple: { name: 'Roxo',    price: 80,  skin: '#aa55ff', skinDk: '#8833dd', antenna: '#8833dd' },
+  red:    { name: 'Vermelho',price: 100, skin: '#ff4444', skinDk: '#cc2222', antenna: '#cc2222' },
+  gold:   { name: 'Dourado', price: 150, skin: '#ffcc00', skinDk: '#ddaa00', antenna: '#ddaa00' },
+};
+const SKIN_ORDER = ['green','blue','pink','purple','red','gold'];
+
+const ACC_DEFS = {
+  hat:        { name: 'Chapéu',  price: 60  },
+  sunglasses: { name: 'Óculos',  price: 80  },
+  cape:       { name: 'Capa',    price: 120 },
+};
+const ACC_ORDER = ['hat','sunglasses','cape'];
+
+// ============================================================
+//  ESTADO DO JOGO
+// ============================================================
+const STATE = { MENU: 0, PLAYING: 1, GAMEOVER: 2, SHOP: 3 };
+let gameState = STATE.MENU;
+let shopTab = 0; // 0 = cores, 1 = acessórios
+
+// Variáveis de jogo
+let score, coinCount, scrollSpeed, baseSpeed, distanceTraveled;
+let isDay, dayNightPhase;
+let player, projectiles, enemies, coins, powerUps, platforms, walls, groundSegs, particles;
+let buildings, stars;
+let spawnTimer, lastFrameTime, animFrame;
+let menuBlink = 0;
+let shopScroll = 0;
+let gameOverTimer = 0;
+
+// ============================================================
+//  SISTEMA DE INPUT
+// ============================================================
+const keys = {};
+const justPressed = {};
+
+document.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (!keys[k]) justPressed[k] = true;
+  keys[k] = true;
+  if (['arrowup','arrowdown','arrowleft','arrowright',' '].includes(e.key.toLowerCase()) || e.key === ' ') {
+    e.preventDefault();
+  }
+});
+document.addEventListener('keyup', e => {
+  keys[e.key.toLowerCase()] = false;
+});
+
+function wasPressed(k) {
+  if (justPressed[k]) { justPressed[k] = false; return true; }
+  return false;
+}
+function clearJustPressed() {
+  for (const k in justPressed) justPressed[k] = false;
+}
+
+// ============================================================
+//  UTILIDADES DE DESENHO
+// ============================================================
+function px(x, y, w, h, color) {
+  CTX.fillStyle = color;
+  CTX.fillRect(Math.floor(x), Math.floor(y), w, h);
+}
+
+// Texto retro com sombra
+function drawText(text, x, y, size, color, align) {
+  CTX.textAlign = align || 'left';
+  CTX.textBaseline = 'top';
+  // Fallback font caso Google Fonts não carregue
+  CTX.font = size + "px 'Press Start 2P', monospace";
+  CTX.fillStyle = '#000';
+  CTX.fillText(text, x + 2, y + 2);
+  CTX.fillStyle = color || '#fff';
+  CTX.fillText(text, x, y);
+}
+
+// Texto com contorno
+function drawTextOutline(text, x, y, size, color, outColor) {
+  CTX.textAlign = 'center';
+  CTX.textBaseline = 'top';
+  CTX.font = size + "px 'Press Start 2P', monospace";
+  CTX.strokeStyle = outColor || '#000';
+  CTX.lineWidth = 4;
+  CTX.strokeText(text, x, y);
+  CTX.fillStyle = color;
+  CTX.fillText(text, x, y);
+}
+
+// ============================================================
+//  DESENHO DO ALIEN (PERSONAGEM)
+// ============================================================
+function getAlienColors() {
+  const s = SKIN_DEFS[save.equipped] || SKIN_DEFS.green;
+  return {
+    skin: s.skin, skinDk: s.skinDk, antenna: s.antenna,
+    eyeW: '#ffffff', eyeP: '#111111', mouth: '#225533',
+    belt: '#888888'
+  };
+}
+
+function drawAlien(x, y, frame, jumping, colors, acc) {
+  const s = PX;
+  const c = colors;
+
+  // --- Capa (atrás do corpo) ---
+  if (acc === 'cape') {
+    CTX.fillStyle = '#cc2222';
+    const capeWave = Math.sin(Date.now() / 120) * 2;
+    CTX.fillRect(x - 1*s, y + 8*s, 3*s, 10*s);
+    CTX.fillRect(x - 2*s, y + 12*s, 3*s, 7*s + capeWave);
+    CTX.fillStyle = '#991111';
+    CTX.fillRect(x - 1*s, y + 10*s, 2*s, 8*s);
+  }
+
+  // --- Antenas ---
+  CTX.fillStyle = c.antenna;
+  CTX.fillRect(x + 2*s, y - 5*s, s, 5*s);
+  CTX.fillRect(x + 9*s, y - 5*s, s, 5*s);
+  // Bolinhas nas pontas
+  CTX.fillStyle = '#ffff55';
+  CTX.fillRect(x + 1*s, y - 6*s, 2*s, 2*s);
+  CTX.fillRect(x + 9*s, y - 6*s, 2*s, 2*s);
+
+  // --- Cabeça ---
+  CTX.fillStyle = c.skin;
+  CTX.fillRect(x + 1*s, y, 10*s, 8*s);
+  CTX.fillRect(x, y + 1*s, 12*s, 6*s);
+
+  // --- Olhos ---
+  CTX.fillStyle = c.eyeW;
+  CTX.fillRect(x + 1*s, y + 2*s, 4*s, 4*s);
+  CTX.fillRect(x + 7*s, y + 2*s, 4*s, 4*s);
+  CTX.fillStyle = c.eyeP;
+  CTX.fillRect(x + 3*s, y + 3*s, 2*s, 2*s);
+  CTX.fillRect(x + 9*s, y + 3*s, 2*s, 2*s);
+  // Brilho nos olhos
+  CTX.fillStyle = '#ffffff';
+  CTX.fillRect(x + 3*s, y + 3*s, s, s);
+  CTX.fillRect(x + 9*s, y + 3*s, s, s);
+
+  // --- Boca ---
+  CTX.fillStyle = c.mouth;
+  CTX.fillRect(x + 4*s, y + 7*s, 4*s, s);
+
+  // --- Corpo ---
+  CTX.fillStyle = c.skin;
+  CTX.fillRect(x + 2*s, y + 8*s, 8*s, 5*s);
+  CTX.fillStyle = c.skinDk;
+  CTX.fillRect(x + 3*s, y + 8*s, 6*s, s); // pescoço
+  // Barriga
+  CTX.fillStyle = '#aaddaa';
+  CTX.fillRect(x + 4*s, y + 10*s, 4*s, 3*s);
+
+  // --- Cinto ---
+  CTX.fillStyle = c.belt;
+  CTX.fillRect(x + 2*s, y + 13*s, 8*s, s);
+
+  // --- Braços ---
+  CTX.fillStyle = c.skin;
+  if (jumping) {
+    CTX.fillRect(x, y + 9*s, 2*s, 3*s);
+    CTX.fillRect(x + 10*s, y + 8*s, 2*s, 3*s);
+  } else {
+    CTX.fillRect(x, y + 9*s + (frame === 0 ? s : 0), 2*s, 3*s);
+    CTX.fillRect(x + 10*s, y + 9*s + (frame === 1 ? s : 0), 2*s, 3*s);
+  }
+
+  // --- Pernas ---
+  CTX.fillStyle = c.skinDk;
+  if (jumping) {
+    // Pernas encolhidas
+    CTX.fillRect(x + 3*s, y + 14*s, 2*s, 2*s);
+    CTX.fillRect(x + 7*s, y + 14*s, 2*s, 2*s);
+  } else {
+    // Animação de corrida
+    const legOffset1 = frame === 0 ? 0 : 2*s;
+    const legOffset2 = frame === 0 ? 2*s : 0;
+    CTX.fillRect(x + 3*s, y + 14*s, 2*s, 3*s + legOffset1/2);
+    CTX.fillRect(x + 7*s, y + 14*s, 2*s, 3*s + legOffset2/2);
+    // Pés
+    CTX.fillStyle = c.antenna;
+    CTX.fillRect(x + 2*s, y + 17*s + legOffset1/2, 3*s, s);
+    CTX.fillRect(x + 7*s, y + 17*s + legOffset2/2, 3*s, s);
+  }
+
+  // --- Chapéu (acessório) ---
+  if (acc === 'hat') {
+    CTX.fillStyle = '#dd4444';
+    CTX.fillRect(x, y - 2*s, 12*s, 3*s);
+    CTX.fillRect(x + 2*s, y - 5*s, 8*s, 3*s);
+    CTX.fillStyle = '#ffcc00';
+    CTX.fillRect(x, y - 2*s, 12*s, s); // aba
+  }
+
+  // --- Óculos escuros (acessório) ---
+  if (acc === 'sunglasses') {
+    CTX.fillStyle = '#111111';
+    CTX.fillRect(x + 1*s, y + 2*s, 4*s, 3*s);
+    CTX.fillRect(x + 7*s, y + 2*s, 4*s, 3*s);
+    CTX.fillRect(x + 5*s, y + 3*s, 2*s, s); // ponte
+    CTX.fillStyle = '#333366';
+    CTX.fillRect(x + 2*s, y + 3*s, 2*s, s);
+    CTX.fillRect(x + 8*s, y + 3*s, 2*s, s);
+  }
+}
+
+// ============================================================
+//  DESENHO DE INIMIGOS
+// ============================================================
+function drawDinoGround(x, y, frame, hp, maxHp, frozen) {
+  const s = PX;
+  const c1 = frozen ? '#88ddff' : '#668833';
+  const c2 = frozen ? '#66bbdd' : '#445522';
+  const c3 = frozen ? '#aaeeff' : '#88aa44';
+
+  // Corpo
+  CTX.fillStyle = c1;
+  CTX.fillRect(x + 2*s, y + 2*s, 10*s, 8*s);
+  CTX.fillRect(x + 4*s, y, 8*s, 2*s); // costas
+  // Cabeça
+  CTX.fillRect(x + 10*s, y - 2*s, 7*s, 6*s);
+  CTX.fillRect(x + 12*s, y - 4*s, 5*s, 2*s); // topo cabeça
+  // Mandíbula
+  CTX.fillStyle = c2;
+  CTX.fillRect(x + 12*s, y + 4*s, 6*s, 2*s);
+  // Dentes
+  CTX.fillStyle = '#ffffff';
+  CTX.fillRect(x + 14*s, y + 3*s, s, s);
+  CTX.fillRect(x + 16*s, y + 3*s, s, s);
+  CTX.fillRect(x + 14*s, y + 4*s, s, s);
+  // Olho
+  CTX.fillStyle = '#ff3333';
+  CTX.fillRect(x + 14*s, y - 1*s, 2*s, 2*s);
+  CTX.fillStyle = '#111';
+  CTX.fillRect(x + 15*s, y - 1*s, s, s);
+
+  // Bracinhos
+  CTX.fillStyle = c3;
+  CTX.fillRect(x + 9*s, y + 6*s, 2*s, 3*s);
+
+  // Cauda
+  CTX.fillStyle = c1;
+  CTX.fillRect(x, y + 4*s, 3*s, 4*s);
+  CTX.fillRect(x - 2*s, y + 5*s, 2*s, 2*s);
+
+  // Pernas
+  CTX.fillStyle = c2;
+  const l1 = frame === 0 ? 0 : s;
+  const l2 = frame === 0 ? s : 0;
+  CTX.fillRect(x + 3*s, y + 10*s, 3*s, 4*s + l1);
+  CTX.fillRect(x + 8*s, y + 10*s, 3*s, 4*s + l2);
+  // Garras
+  CTX.fillStyle = '#aaa';
+  CTX.fillRect(x + 2*s, y + 14*s + l1, 4*s, s);
+  CTX.fillRect(x + 7*s, y + 14*s + l2, 4*s, s);
+
+  // Placas nas costas
+  CTX.fillStyle = c3;
+  CTX.fillRect(x + 5*s, y - s, 2*s, 2*s);
+  CTX.fillRect(x + 8*s, y - s, 2*s, s);
+
+  // Barra de vida
+  if (hp < maxHp || true) {
+    const bw = 14*s;
+    const bx = x + 2*s;
+    const by = y - 8*s;
+    CTX.fillStyle = '#333';
+    CTX.fillRect(bx, by, bw, 3*s);
+    CTX.fillStyle = hp > maxHp/2 ? '#44cc44' : hp > maxHp/4 ? '#cccc44' : '#cc4444';
+    CTX.fillRect(bx, by, bw * (hp / maxHp), 3*s);
+    CTX.strokeStyle = '#000';
+    CTX.lineWidth = 1;
+    CTX.strokeRect(bx, by, bw, 3*s);
+  }
+}
+
+function drawPtero(x, y, frame, hp, maxHp, frozen) {
+  const s = PX;
+  const c1 = frozen ? '#88ddff' : '#885533';
+  const c2 = frozen ? '#66bbdd' : '#663311';
+  const c3 = frozen ? '#aaeeff' : '#aa7744';
+  const wingY = frame === 0 ? -3*s : 2*s;
+
+  // Corpo
+  CTX.fillStyle = c1;
+  CTX.fillRect(x + 4*s, y + 3*s, 10*s, 5*s);
+  // Cabeça
+  CTX.fillRect(x + 14*s, y + 2*s, 6*s, 4*s);
+  // Crista
+  CTX.fillStyle = c3;
+  CTX.fillRect(x + 14*s, y, 3*s, 2*s);
+  // Bico
+  CTX.fillStyle = '#cc9933';
+  CTX.fillRect(x + 20*s, y + 3*s, 4*s, 2*s);
+  CTX.fillRect(x + 20*s, y + 5*s, 3*s, s);
+  // Olho
+  CTX.fillStyle = '#ff3333';
+  CTX.fillRect(x + 17*s, y + 3*s, 2*s, 2*s);
+  CTX.fillStyle = '#111';
+  CTX.fillRect(x + 18*s, y + 3*s, s, s);
+
+  // Asas
+  CTX.fillStyle = c2;
+  CTX.fillRect(x, y + 3*s + wingY, 5*s, 3*s);
+  CTX.fillRect(x - 3*s, y + 4*s + wingY, 3*s, 2*s);
+  CTX.fillRect(x + 9*s, y + 3*s + wingY, 5*s, 3*s);
+
+  // Patas
+  CTX.fillStyle = c2;
+  CTX.fillRect(x + 6*s, y + 8*s, 2*s, 3*s);
+  CTX.fillRect(x + 10*s, y + 8*s, 2*s, 3*s);
+
+  // Cauda
+  CTX.fillStyle = c1;
+  CTX.fillRect(x, y + 5*s, 4*s, 2*s);
+  CTX.fillRect(x - 2*s, y + 6*s, 3*s, s);
+
+  // Barra de vida
+  const bw = 14*s;
+  const bx = x + 3*s;
+  const by = y - 5*s;
+  CTX.fillStyle = '#333';
+  CTX.fillRect(bx, by, bw, 3*s);
+  CTX.fillStyle = hp > maxHp/2 ? '#44cc44' : hp > maxHp/4 ? '#cccc44' : '#cc4444';
+  CTX.fillRect(bx, by, bw * (hp / maxHp), 3*s);
+  CTX.strokeStyle = '#000';
+  CTX.lineWidth = 1;
+  CTX.strokeRect(bx, by, bw, 3*s);
+}
+
+// ============================================================
+//  PARTÍCULAS
+// ============================================================
+function addParticle(x, y, color, count, speed, life) {
+  for (let i = 0; i < count; i++) {
+    particles.push({
+      x, y,
+      vx: (Math.random() - 0.5) * speed * 2,
+      vy: (Math.random() - 0.8) * speed * 2,
+      life: life || 30,
+      maxLife: life || 30,
+      color,
+      size: Math.random() * 3 + 2
+    });
+  }
+}
+
+function addCoinParticle(x, y) {
+  addParticle(x, y, '#ffdd00', 6, 3, 20);
+  addParticle(x, y, '#ffffff', 3, 2, 15);
+}
+
+function addDeathParticle(x, y, color) {
+  addParticle(x, y, color, 12, 5, 35);
+  addParticle(x, y, '#ffffff', 4, 3, 20);
+}
+
+function updateParticles() {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += 0.15;
+    p.life--;
+    if (p.life <= 0) particles.splice(i, 1);
+  }
+}
+
+function drawParticles() {
+  for (const p of particles) {
+    const alpha = p.life / p.maxLife;
+    CTX.globalAlpha = alpha;
+    CTX.fillStyle = p.color;
+    CTX.fillRect(p.x, p.y, p.size, p.size);
+  }
+  CTX.globalAlpha = 1;
+}
+
+// ============================================================
+//  CENÁRIO: CIDADE PÓS-APOCALÍPTICA
+// ============================================================
+function generateBuildings() {
+  buildings = [];
+  for (let i = 0; i < 25; i++) {
+    const bw = 40 + Math.random() * 60;
+    const bh = 60 + Math.random() * 180;
+    buildings.push({
+      x: i * 80 + Math.random() * 40,
+      w: bw, h: bh,
+      windows: Math.floor(bw / 20),
+      floors: Math.floor(bh / 25),
+      damaged: Math.random() > 0.5,
+      damageH: Math.random() * bh * 0.4,
+      color: `hsl(${220 + Math.random()*20}, ${5 + Math.random()*10}%, ${15 + Math.random()*15}%)`
+    });
+  }
+}
+
+function generateStars() {
+  stars = [];
+  for (let i = 0; i < 80; i++) {
+    stars.push({
+      x: Math.random() * W * 2,
+      y: Math.random() * 200,
+      size: Math.random() > 0.8 ? 2 : 1,
+      blink: Math.random() * Math.PI * 2
+    });
+  }
+}
+
+function drawSky() {
+  if (isDay) {
+    // Céu diurno
+    const grad = CTX.createLinearGradient(0, 0, 0, GROUND_Y);
+    grad.addColorStop(0, '#3388cc');
+    grad.addColorStop(0.5, '#66aadddd');
+    grad.addColorStop(0.8, '#ddaa77');
+    grad.addColorStop(1, '#cc8855');
+    CTX.fillStyle = grad;
+    CTX.fillRect(0, 0, W, GROUND_Y);
+
+    // Sol
+    CTX.fillStyle = '#ffdd44';
+    CTX.beginPath();
+    CTX.arc(650, 60, 30, 0, Math.PI * 2);
+    CTX.fill();
+    CTX.fillStyle = '#ffee88';
+    CTX.beginPath();
+    CTX.arc(650, 60, 22, 0, Math.PI * 2);
+    CTX.fill();
+
+    // Nuvens pós-apocalípticas (cinza/marrom)
+    drawCloud(100 + (Date.now()/80 % 900), 50, '#99887766');
+    drawCloud(400 + (Date.now()/100 % 900), 80, '#88776666');
+    drawCloud(600 + (Date.now()/60 % 900), 35, '#aa998866');
+  } else {
+    // Céu noturno - totalmente escuro
+    const grad = CTX.createLinearGradient(0, 0, 0, GROUND_Y);
+    grad.addColorStop(0, '#050510');
+    grad.addColorStop(0.7, '#0a0a20');
+    grad.addColorStop(1, '#111133');
+    CTX.fillStyle = grad;
+    CTX.fillRect(0, 0, W, GROUND_Y);
+
+    // Estrelas
+    const t = Date.now() / 1000;
+    for (const st of stars) {
+      const alpha = 0.3 + Math.sin(t + st.blink) * 0.3 + 0.4;
+      CTX.globalAlpha = alpha;
+      CTX.fillStyle = '#ffffff';
+      const sx = (st.x - distanceTraveled * 0.05) % (W * 2);
+      const screenX = sx < 0 ? sx + W * 2 : sx;
+      if (screenX < W) {
+        CTX.fillRect(screenX, st.y, st.size, st.size);
+      }
+      CTX.globalAlpha = 1;
+    }
+
+    // Lua
+    CTX.fillStyle = '#ccccaa';
+    CTX.beginPath();
+    CTX.arc(600, 70, 25, 0, Math.PI * 2);
+    CTX.fill();
+    CTX.fillStyle = '#050510';
+    CTX.beginPath();
+    CTX.arc(610, 65, 22, 0, Math.PI * 2);
+    CTX.fill();
+  }
+}
+
+function drawCloud(x, y, color) {
+  CTX.fillStyle = color;
+  CTX.beginPath();
+  CTX.arc(x % W, y, 20, 0, Math.PI * 2);
+  CTX.arc((x + 25) % W, y - 5, 15, 0, Math.PI * 2);
+  CTX.arc((x + 50) % W, y, 18, 0, Math.PI * 2);
+  CTX.fill();
+}
+
+function drawBuildings() {
+  const parallax = distanceTraveled * 0.3;
+  for (const b of buildings) {
+    let bx = ((b.x * 3 - parallax) % (25 * 120)) ;
+    if (bx < -100) bx += 25 * 120;
+    if (bx > W + 100) continue;
+    const by = GROUND_Y - b.h;
+
+    // Estrutura principal
+    CTX.fillStyle = b.color;
+    CTX.fillRect(bx, by, b.w, b.h);
+
+    // Detalhes de dano
+    if (b.damaged) {
+      CTX.fillStyle = isDay ? '#445566' : '#0a0a15';
+      // Pedaço faltando no topo
+      CTX.fillRect(bx + b.w * 0.3, by, b.w * 0.4, b.damageH * 0.3);
+      // Rachaduras
+      CTX.strokeStyle = '#333';
+      CTX.lineWidth = 1;
+      CTX.beginPath();
+      CTX.moveTo(bx + b.w * 0.2, by + b.h * 0.3);
+      CTX.lineTo(bx + b.w * 0.5, by + b.h * 0.6);
+      CTX.lineTo(bx + b.w * 0.4, by + b.h * 0.9);
+      CTX.stroke();
+    }
+
+    // Janelas - ESCURAS à noite (humanidade extinta)
+    const winSize = 6;
+    const winGap = 14;
+    for (let wy = 0; wy < b.floors; wy++) {
+      for (let wx = 0; wx < b.windows; wx++) {
+        const winX = bx + 8 + wx * winGap;
+        const winY = by + 10 + wy * 22;
+        if (winY < by + b.h - 15) {
+          if (isDay) {
+            // Dia: janelas refletem luz solar (sem vida interna)
+            CTX.fillStyle = '#556677';
+            CTX.fillRect(winX, winY, winSize, winSize + 2);
+            CTX.fillStyle = '#778899';
+            CTX.fillRect(winX, winY, winSize, 2);
+          } else {
+            // Noite: TOTALMENTE ESCURAS - sem luz nenhuma
+            CTX.fillStyle = '#0a0a15';
+            CTX.fillRect(winX, winY, winSize, winSize + 2);
+          }
+        }
+      }
+    }
+
+    // Borda do prédio
+    CTX.strokeStyle = isDay ? '#334455' : '#111122';
+    CTX.lineWidth = 1;
+    CTX.strokeRect(bx, by, b.w, b.h);
+  }
+}
+
+// ============================================================
+//  SEGMENTOS DE CHÃO
+// ============================================================
+function initGround() {
+  groundSegs = [];
+  // Primeiro segmento longo para segurança
+  groundSegs.push({ x: -100, w: 600 });
+  let cx = 500;
+  for (let i = 0; i < 60; i++) {
+    const gap = 40 + Math.random() * 50;
+    const segW = 200 + Math.random() * 300;
+    cx += gap;
+    groundSegs.push({ x: cx, w: segW });
+    cx += segW;
+  }
+}
+
+function drawGround() {
+  for (const seg of groundSegs) {
+    const sx = seg.x - distanceTraveled;
+    if (sx > W + 50 || sx + seg.w < -50) continue;
+
+    // Superfície do chão
+    CTX.fillStyle = isDay ? '#665544' : '#222211';
+    CTX.fillRect(sx, GROUND_Y, seg.w, 6);
+
+    // Terra abaixo
+    CTX.fillStyle = isDay ? '#443322' : '#1a1a0f';
+    CTX.fillRect(sx, GROUND_Y + 6, seg.w, H - GROUND_Y - 6);
+
+    // Textura do chão
+    CTX.fillStyle = isDay ? '#776655' : '#2a2a18';
+    for (let i = 0; i < seg.w; i += 20) {
+      CTX.fillRect(sx + i, GROUND_Y, 8, 3);
+    }
+    // Grama/musgo pós-apocalíptico
+    CTX.fillStyle = isDay ? '#557733' : '#1a2a11';
+    for (let i = 0; i < seg.w; i += 12) {
+      const h = 2 + Math.sin(i * 0.5) * 2;
+      CTX.fillRect(sx + i, GROUND_Y - h, 4, h);
+    }
+  }
+
+  // Fundo do abismo
+  CTX.fillStyle = '#0a0505';
+  CTX.fillRect(0, GROUND_Y + 30, W, H - GROUND_Y - 30);
+}
+
+function isOverGround(wx, wy) {
+  // Verifica se a posição world wx está sobre um segmento de chão
+  for (const seg of groundSegs) {
+    if (wx >= seg.x && wx <= seg.x + seg.w) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function extendGround() {
+  const last = groundSegs[groundSegs.length - 1];
+  const endX = last.x + last.w;
+  const rightEdge = distanceTraveled + W + 400;
+
+  if (endX < rightEdge) {
+    const diff = Math.min(1, score / 5000);
+    const gap = 45 + Math.random() * (40 + diff * 40);
+    const segW = 180 + Math.random() * (300 - diff * 100);
+    groundSegs.push({ x: endX + gap, w: Math.max(100, segW) });
+  }
+
+  // Limpar segmentos antigos
+  while (groundSegs.length > 3 && groundSegs[0].x + groundSegs[0].w < distanceTraveled - 200) {
+    groundSegs.shift();
+  }
+}
+
+// ============================================================
+//  PLATAFORMAS
+// ============================================================
+function spawnPlatform() {
+  const x = distanceTraveled + W + 50;
+  const y = GROUND_Y - 60 - Math.random() * 120;
+  const w = 60 + Math.random() * 80;
+  platforms.push({ x, y, w, h: 10 });
+}
+
+function drawPlatforms() {
+  for (const p of platforms) {
+    const sx = p.x - distanceTraveled;
+    if (sx > W + 50 || sx + p.w < -50) continue;
+    // Plataforma com pixel art
+    CTX.fillStyle = isDay ? '#887766' : '#333322';
+    CTX.fillRect(sx, p.y, p.w, p.h);
+    CTX.fillStyle = isDay ? '#998877' : '#444433';
+    CTX.fillRect(sx, p.y, p.w, 4);
+    CTX.fillStyle = isDay ? '#776655' : '#222211';
+    CTX.fillRect(sx + 2, p.y + p.h - 3, p.w - 4, 3);
+    // Suportes
+    CTX.fillStyle = isDay ? '#665544' : '#2a2a1a';
+    CTX.fillRect(sx + 5, p.y + p.h, 4, 6);
+    CTX.fillRect(sx + p.w - 9, p.y + p.h, 4, 6);
+  }
+}
+
+// ============================================================
+//  PAREDES DE IMPACTO
+// ============================================================
+function spawnWall() {
+  const x = distanceTraveled + W + 50;
+  const wh = 40 + Math.random() * 30;
+  walls.push({ x, y: GROUND_Y - wh, w: 15, h: wh });
+}
+
+function drawWalls() {
+  for (const wall of walls) {
+    const sx = wall.x - distanceTraveled;
+    if (sx > W + 50 || sx + wall.w < -50) continue;
+    // Parede sólida de pedra
+    CTX.fillStyle = isDay ? '#776666' : '#332222';
+    CTX.fillRect(sx, wall.y, wall.w, wall.h);
+    CTX.fillStyle = isDay ? '#887777' : '#443333';
+    CTX.fillRect(sx, wall.y, wall.w, 4);
+    // Textura de tijolos
+    CTX.fillStyle = isDay ? '#665555' : '#2a1a1a';
+    for (let by = 0; by < wall.h; by += 10) {
+      const off = (Math.floor(by / 10) % 2) * 6;
+      CTX.fillRect(sx + off, wall.y + by, wall.w / 2 - 1, 1);
+    }
+    // Aviso visual (marcas vermelhas)
+    CTX.fillStyle = '#cc333388';
+    CTX.fillRect(sx + 2, wall.y + 4, wall.w - 4, 3);
+    CTX.fillRect(sx + 2, wall.y + wall.h - 7, wall.w - 4, 3);
+  }
+}
+
+// ============================================================
+//  MOEDAS
+// ============================================================
+function spawnCoin(x, y) {
+  coins.push({ x: x || distanceTraveled + W + Math.random() * 100,
+                y: y || GROUND_Y - 30 - Math.random() * 100,
+                collected: false, bobPhase: Math.random() * Math.PI * 2 });
+}
+
+function drawCoins() {
+  const t = Date.now() / 300;
+  for (const c of coins) {
+    if (c.collected) continue;
+    const sx = c.x - distanceTraveled;
+    if (sx > W + 30 || sx < -30) continue;
+    const bob = Math.sin(t + c.bobPhase) * 3;
+    const cy = c.y + bob;
+
+    // Moeda pixel art
+    CTX.fillStyle = '#ffcc00';
+    CTX.fillRect(sx - 4, cy - 5, 8, 10);
+    CTX.fillStyle = '#ffdd44';
+    CTX.fillRect(sx - 3, cy - 6, 6, 12);
+    CTX.fillStyle = '#ffee88';
+    CTX.fillRect(sx - 2, cy - 3, 2, 6);
+    // "$" symbol
+    CTX.fillStyle = '#cc9900';
+    CTX.fillRect(sx - 1, cy - 3, 3, 1);
+    CTX.fillRect(sx - 1, cy - 1, 3, 1);
+    CTX.fillRect(sx + 1, cy - 3, 1, 2);
+    CTX.fillRect(sx - 1, cy - 1, 1, 2);
+    CTX.fillRect(sx, cy - 4, 1, 8);
+
+    // Brilho
+    CTX.globalAlpha = 0.3 + Math.sin(t * 2 + c.bobPhase) * 0.2;
+    CTX.fillStyle = '#ffffff';
+    CTX.fillRect(sx - 6, cy - 7, 12, 14);
+    CTX.globalAlpha = 1;
+  }
+}
+
+// ============================================================
+//  POWER-UPS
+// ============================================================
+function spawnPowerUp() {
+  const type = 1 + Math.floor(Math.random() * 3); // ICE, FIRE, EARTH
+  powerUps.push({
+    x: distanceTraveled + W + 50,
+    y: GROUND_Y - 50 - Math.random() * 80,
+    type, collected: false, bobPhase: Math.random() * Math.PI * 2
+  });
+}
+
+function drawPowerUps() {
+  const t = Date.now() / 250;
+  for (const pu of powerUps) {
+    if (pu.collected) continue;
+    const sx = pu.x - distanceTraveled;
+    if (sx > W + 30 || sx < -30) continue;
+    const bob = Math.sin(t + pu.bobPhase) * 4;
+    const py = pu.y + bob;
+
+    // Aura
+    CTX.globalAlpha = 0.2 + Math.sin(t * 2) * 0.1;
+    CTX.fillStyle = PWR_COLORS[pu.type];
+    CTX.beginPath();
+    CTX.arc(sx, py, 16, 0, Math.PI * 2);
+    CTX.fill();
+    CTX.globalAlpha = 1;
+
+    // Cristal/Orbe
+    const colors = {
+      1: ['#44ddff', '#2299cc', '#aaeeff'], // Gelo
+      2: ['#ff6622', '#cc3300', '#ffaa44'], // Fogo
+      3: ['#aa7733', '#775522', '#ccaa66'], // Terra
+    };
+    const cc = colors[pu.type];
+    CTX.fillStyle = cc[0];
+    CTX.fillRect(sx - 6, py - 8, 12, 16);
+    CTX.fillStyle = cc[1];
+    CTX.fillRect(sx - 4, py - 10, 8, 20);
+    CTX.fillStyle = cc[2];
+    CTX.fillRect(sx - 2, py - 4, 4, 8);
+
+    // Ícone
+    CTX.fillStyle = '#fff';
+    if (pu.type === PWR_ICE) {
+      // Floco
+      CTX.fillRect(sx - 1, py - 5, 2, 10);
+      CTX.fillRect(sx - 4, py - 1, 8, 2);
+    } else if (pu.type === PWR_FIRE) {
+      // Chama
+      CTX.fillRect(sx - 1, py - 4, 2, 4);
+      CTX.fillRect(sx - 2, py, 4, 2);
+      CTX.fillRect(sx - 1, py + 2, 2, 2);
+    } else {
+      // Rocha
+      CTX.fillRect(sx - 3, py - 2, 6, 4);
+      CTX.fillRect(sx - 2, py - 3, 4, 6);
+    }
+  }
+}
+
+// ============================================================
+//  PROJÉTEIS
+// ============================================================
+function shootProjectile() {
+  const type = player.power;
+  const px = player.worldX + 36;
+  const py = player.y + 15;
+  const speed = 8 + scrollSpeed;
+
+  projectiles.push({
+    x: px, y: py,
+    vx: speed, vy: 0,
+    type, life: 80,
+    size: type === PWR_NONE ? 5 : 8
+  });
+
+  if (type !== PWR_NONE) {
+    player.powerShots--;
+    if (player.powerShots <= 0) {
+      player.power = PWR_NONE;
+      player.powerShots = 0;
+    }
+  }
+
+  // Efeito de recuo leve
+  addParticle(player.worldX + 30 - distanceTraveled, py, PWR_COLORS[type], 3, 2, 10);
+}
+
+function drawProjectiles() {
+  for (const p of projectiles) {
+    const sx = p.x - distanceTraveled;
+    if (sx > W + 20 || sx < -20) continue;
+
+    if (p.type === PWR_NONE) {
+      CTX.fillStyle = '#aaeeff';
+      CTX.fillRect(sx - 3, p.y - 2, 8, 4);
+      CTX.fillStyle = '#ffffff';
+      CTX.fillRect(sx - 1, p.y - 1, 5, 2);
+    } else if (p.type === PWR_ICE) {
+      CTX.fillStyle = '#44ddff';
+      CTX.fillRect(sx - 5, p.y - 4, 12, 8);
+      CTX.fillStyle = '#aaeeff';
+      CTX.fillRect(sx - 3, p.y - 2, 8, 4);
+      CTX.fillStyle = '#ffffff';
+      CTX.fillRect(sx, p.y - 1, 4, 2);
+      // Trail
+      CTX.globalAlpha = 0.4;
+      CTX.fillStyle = '#88eeff';
+      CTX.fillRect(sx - 12, p.y - 2, 10, 4);
+      CTX.globalAlpha = 1;
+    } else if (p.type === PWR_FIRE) {
+      CTX.fillStyle = '#ff4400';
+      CTX.fillRect(sx - 5, p.y - 5, 12, 10);
+      CTX.fillStyle = '#ff8800';
+      CTX.fillRect(sx - 3, p.y - 3, 10, 6);
+      CTX.fillStyle = '#ffcc00';
+      CTX.fillRect(sx, p.y - 2, 6, 4);
+      // Trail
+      CTX.globalAlpha = 0.3;
+      CTX.fillStyle = '#ff6600';
+      CTX.fillRect(sx - 15, p.y - 3, 13, 6);
+      CTX.globalAlpha = 1;
+    } else if (p.type === PWR_EARTH) {
+      CTX.fillStyle = '#886633';
+      CTX.fillRect(sx - 5, p.y - 5, 12, 10);
+      CTX.fillStyle = '#aa8844';
+      CTX.fillRect(sx - 3, p.y - 4, 10, 8);
+      CTX.fillStyle = '#665522';
+      CTX.fillRect(sx + 2, p.y - 2, 4, 4);
+      // Trail
+      CTX.globalAlpha = 0.3;
+      CTX.fillStyle = '#997744';
+      CTX.fillRect(sx - 12, p.y - 2, 10, 4);
+      CTX.globalAlpha = 1;
+    }
+  }
+}
+
+// ============================================================
+//  INIMIGOS
+// ============================================================
+function spawnEnemy() {
+  const type = Math.random() > 0.4 ? 'dino' : 'ptero';
+  const diff = Math.min(1, score / 5000);
+  const hp = type === 'dino' ? 3 + Math.floor(diff * 2) : 3 + Math.floor(diff);
+
+  if (type === 'dino') {
+    // Achar segmento de chão para spawnar
+    const sx = distanceTraveled + W + 50 + Math.random() * 100;
+    enemies.push({
+      type: 'dino', x: sx, y: GROUND_Y - 15 * PX,
+      w: 18 * PX, h: 15 * PX,
+      hp, maxHp: hp,
+      frame: 0, frameTimer: 0,
+      frozen: false, frozenTimer: 0
+    });
+  } else {
+    const sx = distanceTraveled + W + 50;
+    const ey = 80 + Math.random() * 150;
+    enemies.push({
+      type: 'ptero', x: sx, y: ey,
+      w: 24 * PX, h: 11 * PX,
+      hp, maxHp: hp,
+      frame: 0, frameTimer: 0,
+      frozen: false, frozenTimer: 0,
+      baseY: ey, flyPhase: Math.random() * Math.PI * 2
+    });
+  }
+}
+
+// ============================================================
+//  INICIALIZAR JOGO
+// ============================================================
+function initGame() {
+  score = 0;
+  coinCount = 0;
+  scrollSpeed = 3;
+  baseSpeed = 3;
+  distanceTraveled = 0;
+  isDay = true;
+  dayNightPhase = 0;
+  animFrame = 0;
+  spawnTimer = { enemy: 0, coin: 0, platform: 0, wall: 0, powerUp: 0 };
+  gameOverTimer = 0;
+
+  player = {
+    worldX: 120,
+    y: GROUND_Y - 18 * PX,
+    vy: 0,
+    jumps: 0,
+    maxJumps: 2,
+    onGround: true,
+    onPlatform: false,
+    shootCooldown: 0,
+    power: PWR_NONE,
+    powerShots: 0,
+    frame: 0,
+    frameTimer: 0,
+    width: 12 * PX,
+    height: 18 * PX,
+    alive: true,
+  };
+
+  projectiles = [];
+  enemies = [];
+  coins = [];
+  powerUps = [];
+  platforms = [];
+  walls = [];
+  particles = [];
+
+  initGround();
+  generateBuildings();
+  generateStars();
+
+  // Spawnar moedas e plataformas iniciais
+  for (let i = 0; i < 5; i++) {
+    spawnCoin(300 + i * 200, GROUND_Y - 40 - Math.random() * 60);
+  }
+}
+
+// ============================================================
+//  ATUALIZAÇÃO PRINCIPAL
+// ============================================================
+function updateGame(dt) {
+  if (!player.alive) {
+    gameOverTimer += dt;
+    updateParticles();
+    if (gameOverTimer > 1.5) {
+      // Salvar recorde
+      if (score > save.highScore) save.highScore = Math.floor(score);
+      save.coins += coinCount;
+      writeSave();
+      gameState = STATE.GAMEOVER;
+    }
+    return;
+  }
+
+  // Progressão de velocidade
+  baseSpeed = 3 + Math.min(5, score / 2000);
+  scrollSpeed = baseSpeed;
+
+  // Distância e pontuação
+  distanceTraveled += scrollSpeed;
+  score += scrollSpeed * 0.02;
+
+  // Ciclo Dia/Noite
+  const newPhase = Math.floor(score / DAY_NIGHT_INTERVAL);
+  if (newPhase !== dayNightPhase) {
+    dayNightPhase = newPhase;
+    isDay = newPhase % 2 === 0;
+  }
+
+  // Animação do jogador
+  player.frameTimer += dt;
+  if (player.frameTimer > 0.15) {
+    player.frameTimer = 0;
+    player.frame = 1 - player.frame;
+  }
+
+  // Mover jogador com o mundo
+  player.worldX = distanceTraveled + PLAYER_X;
+
+  // --- INPUT: PULAR ---
+  if (wasPressed('w') || wasPressed('arrowup') || wasPressed(' ')) {
+    if (player.jumps < player.maxJumps) {
+      player.vy = JUMP_VEL;
+      player.jumps++;
+      player.onGround = false;
+      player.onPlatform = false;
+      addParticle(PLAYER_X + player.width/2, player.y + player.height, '#ffffff', 4, 2, 12);
+    }
+  }
+
+  // --- INPUT: ATIRAR ---
+  if (player.shootCooldown > 0) player.shootCooldown -= dt;
+  if ((keys['k'] || keys['a']) && player.shootCooldown <= 0) {
+    shootProjectile();
+    player.shootCooldown = 0.2;
+  }
+
+  // --- FÍSICA DO JOGADOR ---
+  player.vy += GRAVITY;
+  player.y += player.vy;
+
+  // Colisão com chão
+  player.onGround = false;
+  player.onPlatform = false;
+  const pLeft = player.worldX;
+  const pRight = player.worldX + player.width;
+  const pBottom = player.y + player.height;
+
+  // Verificar segmentos de chão
+  for (const seg of groundSegs) {
+    if (pRight > seg.x && pLeft < seg.x + seg.w) {
+      if (pBottom >= GROUND_Y && player.vy >= 0) {
+        player.y = GROUND_Y - player.height;
+        player.vy = 0;
+        player.onGround = true;
+        player.jumps = 0;
+        break;
+      }
+    }
+  }
+
+  // Verificar plataformas
+  if (!player.onGround) {
+    for (const plat of platforms) {
+      const platSX = plat.x;
+      if (pRight > platSX && pLeft < platSX + plat.w) {
+        if (pBottom >= plat.y && pBottom - player.vy <= plat.y + 5 && player.vy >= 0) {
+          player.y = plat.y - player.height;
+          player.vy = 0;
+          player.onPlatform = true;
+          player.onGround = true;
+          player.jumps = 0;
+          break;
+        }
+      }
+    }
+  }
+
+  // Queda no abismo (morte)
+  if (player.y > H + 50) {
+    killPlayer();
+    return;
+  }
+
+  // --- SPAWN DE OBJETOS ---
+  spawnTimer.enemy += dt;
+  spawnTimer.coin += dt;
+  spawnTimer.platform += dt;
+  spawnTimer.wall += dt;
+  spawnTimer.powerUp += dt;
+
+  const diff = Math.min(1, score / 3000);
+
+  if (spawnTimer.enemy > 1.8 - diff * 0.8) {
+    spawnTimer.enemy = 0;
+    spawnEnemy();
+  }
+  if (spawnTimer.coin > 0.6) {
+    spawnTimer.coin = 0;
+    spawnCoin();
+  }
+  if (spawnTimer.platform > 2.5 - diff * 0.5) {
+    spawnTimer.platform = 0;
+    spawnPlatform();
+  }
+  if (spawnTimer.wall > 4 - diff * 1.5) {
+    spawnTimer.wall = 0;
+    spawnWall();
+  }
+  if (spawnTimer.powerUp > 12 - diff * 3) {
+    spawnTimer.powerUp = 0;
+    spawnPowerUp();
+  }
+
+  // Extensão do chão
+  extendGround();
+
+  // --- ATUALIZAR PROJÉTEIS ---
+  for (let i = projectiles.length - 1; i >= 0; i--) {
+    const p = projectiles[i];
+    p.x += p.vx;
+    p.life--;
+    if (p.life <= 0 || p.x - distanceTraveled > W + 50) {
+      projectiles.splice(i, 1);
+    }
+  }
+
+  // --- ATUALIZAR INIMIGOS ---
+  for (let i = enemies.length - 1; i >= 0; i--) {
+    const e = enemies[i];
+
+    // Animação
+    e.frameTimer += dt;
+    if (e.frameTimer > 0.2) {
+      e.frameTimer = 0;
+      e.frame = 1 - e.frame;
+    }
+
+    // Congelamento
+    if (e.frozen) {
+      e.frozenTimer -= dt;
+      if (e.frozenTimer <= 0) e.frozen = false;
+    }
+
+    // Movimento do ptero
+    if (e.type === 'ptero' && !e.frozen) {
+      e.flyPhase += dt * 2;
+      e.y = e.baseY + Math.sin(e.flyPhase) * 30;
+    }
+
+    // Remover se saiu da tela pela esquerda
+    if (e.x + e.w < distanceTraveled - 50) {
+      enemies.splice(i, 1);
+      continue;
+    }
+
+    // Colisão projétil-inimigo
+    for (let j = projectiles.length - 1; j >= 0; j--) {
+      const p = projectiles[j];
+      const esx = e.x;
+      if (p.x > esx && p.x < esx + e.w && p.y > e.y && p.y < e.y + e.h) {
+        // Acertou!
+        let dmg = 1;
+        if (p.type === PWR_ICE) {
+          e.frozen = true;
+          e.frozenTimer = 2;
+          dmg = 1;
+        } else if (p.type === PWR_FIRE) {
+          dmg = 2;
+          addParticle(p.x - distanceTraveled, p.y, '#ff4400', 8, 4, 20);
+          addParticle(p.x - distanceTraveled, p.y, '#ffcc00', 5, 3, 15);
+        } else if (p.type === PWR_EARTH) {
+          dmg = 2;
+          addParticle(p.x - distanceTraveled, p.y, '#886633', 6, 3, 18);
+        }
+
+        e.hp -= dmg;
+        addParticle(p.x - distanceTraveled, p.y, '#ffffff', 3, 2, 10);
+        projectiles.splice(j, 1);
+
+        if (e.hp <= 0) {
+          // Inimigo morreu!
+          const sx = e.x - distanceTraveled;
+          const bonusColor = p.type !== PWR_NONE ? PWR_COLORS[p.type] : '#ffffff';
+          addDeathParticle(sx + e.w/2, e.y + e.h/2, bonusColor);
+
+          // Pontos (bônus de estilo para poderes)
+          let pts = e.type === 'dino' ? 100 : 150;
+          if (p.type !== PWR_NONE) {
+            pts *= 2; // BÔNUS DE ESTILO!
+            showFloatingText(sx + e.w/2, e.y - 20, '+' + pts + ' STYLE!', PWR_COLORS[p.type]);
+          } else {
+            showFloatingText(sx + e.w/2, e.y - 20, '+' + pts, '#ffffff');
+          }
+          score += pts;
+
+          enemies.splice(i, 1);
+        }
+        break;
+      }
+    }
+  }
+
+  // --- COLISÃO JOGADOR-INIMIGO ---
+  const playerHB = {
+    x: player.worldX + 4, y: player.y + 4,
+    w: player.width - 8, h: player.height - 8
+  };
+  for (const e of enemies) {
+    const enemyHB = { x: e.x, y: e.y, w: e.w, h: e.h };
+    if (aabbCollision(playerHB, enemyHB)) {
+      killPlayer();
+      return;
+    }
+  }
+
+  // --- COLISÃO JOGADOR-PAREDE ---
+  for (const wall of walls) {
+    const wallHB = { x: wall.x, y: wall.y, w: wall.w, h: wall.h };
+    // Colisão frontal (morte)
+    if (playerHB.x + playerHB.w > wallHB.x &&
+        playerHB.x < wallHB.x + wallHB.w * 0.5 &&
+        playerHB.y + playerHB.h > wallHB.y &&
+        playerHB.y < wallHB.y + wallHB.h) {
+      killPlayer();
+      return;
+    }
+  }
+
+  // --- COLISÃO JOGADOR-MOEDA ---
+  for (const c of coins) {
+    if (c.collected) continue;
+    const cdist = Math.hypot(c.x - (player.worldX + player.width/2), c.y - (player.y + player.height/2));
+    if (cdist < 25) {
+      c.collected = true;
+      coinCount++;
+      addCoinParticle(c.x - distanceTraveled, c.y);
+      showFloatingText(c.x - distanceTraveled, c.y - 15, '+1', '#ffdd00');
+    }
+  }
+
+  // --- COLISÃO JOGADOR-POWERUP ---
+  for (const pu of powerUps) {
+    if (pu.collected) continue;
+    const pdist = Math.hypot(pu.x - (player.worldX + player.width/2), pu.y - (player.y + player.height/2));
+    if (pdist < 30) {
+      pu.collected = true;
+      player.power = pu.type;
+      player.powerShots = PWR_SHOTS;
+      addParticle(pu.x - distanceTraveled, pu.y, PWR_COLORS[pu.type], 10, 4, 25);
+      showFloatingText(pu.x - distanceTraveled, pu.y - 20, PWR_NAMES[pu.type] + '!', PWR_COLORS[pu.type]);
+    }
+  }
+
+  // --- LIMPAR OBJETOS FORA DA TELA ---
+  coins = coins.filter(c => !c.collected || c.x - distanceTraveled > -100);
+  coins = coins.filter(c => c.x - distanceTraveled > -100);
+  powerUps = powerUps.filter(pu => pu.x - distanceTraveled > -100);
+  platforms = platforms.filter(p => p.x + p.w - distanceTraveled > -100);
+  walls = walls.filter(w => w.x + w.w - distanceTraveled > -100);
+
+  // Atualizar partículas
+  updateParticles();
+
+  // Atualizar textos flutuantes
+  updateFloatingTexts();
+}
+
+// ============================================================
+//  TEXTOS FLUTUANTES
+// ============================================================
+let floatingTexts = [];
+
+function showFloatingText(x, y, text, color) {
+  floatingTexts.push({ x, y, text, color, life: 45, maxLife: 45 });
+}
+
+function updateFloatingTexts() {
+  for (let i = floatingTexts.length - 1; i >= 0; i--) {
+    floatingTexts[i].y -= 1;
+    floatingTexts[i].life--;
+    if (floatingTexts[i].life <= 0) floatingTexts.splice(i, 1);
+  }
+}
+
+function drawFloatingTexts() {
+  for (const ft of floatingTexts) {
+    CTX.globalAlpha = ft.life / ft.maxLife;
+    drawTextOutline(ft.text, ft.x, ft.y, 8, ft.color, '#000');
+    CTX.globalAlpha = 1;
+  }
+}
+
+// ============================================================
+//  COLISÃO AABB
+// ============================================================
+function aabbCollision(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x &&
+         a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// ============================================================
+//  MORTE DO JOGADOR
+// ============================================================
+function killPlayer() {
+  if (!player.alive) return;
+  player.alive = false;
+  gameOverTimer = 0;
+  addDeathParticle(PLAYER_X + player.width/2, player.y + player.height/2, getAlienColors().skin);
+  addParticle(PLAYER_X + player.width/2, player.y + player.height/2, '#ff4444', 10, 5, 30);
+}
+
+// ============================================================
+//  RENDERIZAÇÃO DO JOGO
+// ============================================================
+function renderGame() {
+  // Limpar tela
+  CTX.clearRect(0, 0, W, H);
+
+  // Céu
+  drawSky();
+
+  // Prédios (fundo)
+  drawBuildings();
+
+  // Chão
+  drawGround();
+
+  // Plataformas
+  drawPlatforms();
+
+  // Paredes
+  drawWalls();
+
+  // Moedas
+  drawCoins();
+
+  // Power-ups
+  drawPowerUps();
+
+  // Inimigos
+  for (const e of enemies) {
+    const sx = e.x - distanceTraveled;
+    if (sx > W + 60 || sx < -80) continue;
+    if (e.type === 'dino') {
+      drawDinoGround(sx, e.y, e.frame, e.hp, e.maxHp, e.frozen);
+    } else {
+      drawPtero(sx, e.y, e.frame, e.hp, e.maxHp, e.frozen);
+    }
+  }
+
+  // Projéteis
+  drawProjectiles();
+
+  // Jogador
+  if (player.alive) {
+    const colors = getAlienColors();
+    const jumping = !player.onGround;
+    drawAlien(PLAYER_X, player.y, player.frame, jumping, colors, save.accessory);
+  }
+
+  // Partículas
+  drawParticles();
+
+  // Textos flutuantes
+  drawFloatingTexts();
+
+  // HUD
+  drawHUD();
+}
+
+// ============================================================
+//  HUD (INTERFACE)
+// ============================================================
+function drawHUD() {
+  // Fundo do HUD
+  CTX.fillStyle = 'rgba(0,0,0,0.5)';
+  CTX.fillRect(0, 0, W, 36);
+
+  // Pontuação
+  drawText('SCORE: ' + Math.floor(score), 10, 8, 10, '#ffffff');
+
+  // Moedas
+  CTX.fillStyle = '#ffcc00';
+  CTX.fillRect(250, 10, 10, 12);
+  CTX.fillStyle = '#ffdd44';
+  CTX.fillRect(252, 9, 6, 14);
+  drawText('' + coinCount, 268, 8, 10, '#ffdd44');
+
+  // Power atual
+  if (player.power !== PWR_NONE) {
+    drawText(PWR_NAMES[player.power].toUpperCase() + ': ' + player.powerShots, 380, 8, 9, PWR_COLORS[player.power]);
+  }
+
+  // Recorde
+  drawText('HI: ' + save.highScore, W - 10, 8, 9, '#aaaaaa', 'right');
+
+  // Indicador dia/noite
+  const dnText = isDay ? '☀ DIA' : '🌙 NOITE';
+  drawText(dnText, W - 10, 24, 7, isDay ? '#ffdd44' : '#8888cc', 'right');
+}
+
+// ============================================================
+//  TELA DE MENU PRINCIPAL
+// ============================================================
+function renderMenu() {
+  // Fundo animado
+  const t = Date.now() / 1000;
+  const grad = CTX.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#0a0a1a');
+  grad.addColorStop(0.5, '#1a1a3a');
+  grad.addColorStop(1, '#0a0a2a');
+  CTX.fillStyle = grad;
+  CTX.fillRect(0, 0, W, H);
+
+  // Estrelas de fundo
+  for (let i = 0; i < 50; i++) {
+    const sx = (i * 137 + t * 20) % W;
+    const sy = (i * 89) % (H - 100);
+    CTX.fillStyle = '#ffffff';
+    CTX.globalAlpha = 0.3 + Math.sin(t * 2 + i) * 0.3;
+    CTX.fillRect(sx, sy, 2, 2);
+  }
+  CTX.globalAlpha = 1;
+
+  // Cidade silhueta no fundo
+  CTX.fillStyle = '#111122';
+  for (let i = 0; i < 15; i++) {
+    const bx = i * 60;
+    const bh = 50 + Math.sin(i * 2.3) * 40;
+    CTX.fillRect(bx, H - 80 - bh, 50, bh + 80);
+  }
+  CTX.fillStyle = '#0a0a15';
+  CTX.fillRect(0, H - 80, W, 80);
+
+  // Título do jogo
+  const titleY = 50 + Math.sin(t * 1.5) * 5;
+  CTX.save();
+  // Sombra do título
+  CTX.shadowColor = '#6644ff';
+  CTX.shadowBlur = 20;
+  drawTextOutline('ALIEN DASH', W/2, titleY, 32, '#44ff88', '#000');
+  CTX.shadowBlur = 0;
+  CTX.restore();
+  drawTextOutline('Corrida Alienígena', W/2, titleY + 45, 12, '#88aacc', '#000');
+
+  // Alien dançando no menu
+  const alienMenuY = 160 + Math.sin(t * 3) * 5;
+  const menuFrame = Math.floor(t * 4) % 2;
+  const colors = getAlienColors();
+  drawAlien(W/2 - 18, alienMenuY, menuFrame, false, colors, save.accessory);
+
+  // Recorde
+  drawTextOutline('RECORDE: ' + save.highScore, W/2, 240, 11, '#ffdd44', '#000');
+  // Moedas salvas
+  drawTextOutline('MOEDAS: ' + save.coins, W/2, 260, 10, '#ffcc00', '#000');
+
+  // Botões
+  menuBlink = (menuBlink + 1) % 60;
+  const btnAlpha = 0.7 + Math.sin(t * 4) * 0.3;
+
+  // Botão Jogar
+  CTX.fillStyle = `rgba(68, 255, 136, ${0.15 + Math.sin(t * 3) * 0.05})`;
+  CTX.fillRect(W/2 - 120, 290, 240, 36);
+  CTX.strokeStyle = '#44ff88';
+  CTX.lineWidth = 2;
+  CTX.strokeRect(W/2 - 120, 290, 240, 36);
+  drawTextOutline('ENTER - JOGAR', W/2, 298, 11, '#44ff88', '#000');
+
+  // Botão Loja
+  CTX.fillStyle = 'rgba(255, 170, 0, 0.12)';
+  CTX.fillRect(W/2 - 120, 338, 240, 36);
+  CTX.strokeStyle = '#ffaa00';
+  CTX.lineWidth = 2;
+  CTX.strokeRect(W/2 - 120, 338, 240, 36);
+  drawTextOutline('L - LOJA DE SKINS', W/2, 346, 10, '#ffaa00', '#000');
+
+  // Controles
+  CTX.fillStyle = 'rgba(0,0,0,0.4)';
+  CTX.fillRect(20, H - 60, W - 40, 50);
+  drawText('W / ↑ = Pular     K / A = Atirar', 40, H - 48, 8, '#8899aa');
+  drawText('DUPLO PULO disponível!  Poderes: Gelo, Fogo, Terra', 40, H - 32, 7, '#667788');
+}
+
+function updateMenu() {
+  if (wasPressed('enter') || wasPressed(' ')) {
+    gameState = STATE.PLAYING;
+    initGame();
+    return;
+  }
+  if (wasPressed('l')) {
+    gameState = STATE.SHOP;
+    shopTab = 0;
+    return;
+  }
+}
+
+// ============================================================
+//  TELA DE GAME OVER
+// ============================================================
+function renderGameOver() {
+  // Fundo escurecido
+  CTX.fillStyle = 'rgba(10, 5, 15, 0.85)';
+  CTX.fillRect(0, 0, W, H);
+
+  const t = Date.now() / 1000;
+
+  // Título
+  drawTextOutline('GAME OVER', W/2, 80, 28, '#ff4444', '#000');
+
+  // Pontuação
+  drawTextOutline('PONTUAÇÃO: ' + Math.floor(score), W/2, 150, 14, '#ffffff', '#000');
+
+  // Moedas desta partida
+  drawTextOutline('MOEDAS: +' + coinCount, W/2, 180, 11, '#ffcc00', '#000');
+
+  // Novo recorde?
+  if (Math.floor(score) >= save.highScore && Math.floor(score) > 0) {
+    const flash = Math.sin(t * 6) > 0 ? '#ffff44' : '#ff8800';
+    drawTextOutline('★ NOVO RECORDE! ★', W/2, 220, 14, flash, '#000');
+  } else {
+    drawTextOutline('RECORDE: ' + save.highScore, W/2, 220, 11, '#aaaaaa', '#000');
+  }
+
+  // Botões
+  CTX.fillStyle = 'rgba(68, 255, 136, 0.12)';
+  CTX.fillRect(W/2 - 140, 280, 280, 36);
+  CTX.strokeStyle = '#44ff88';
+  CTX.lineWidth = 2;
+  CTX.strokeRect(W/2 - 140, 280, 280, 36);
+  drawTextOutline('ENTER - JOGAR DE NOVO', W/2, 288, 10, '#44ff88', '#000');
+
+  CTX.fillStyle = 'rgba(136, 136, 170, 0.12)';
+  CTX.fillRect(W/2 - 140, 330, 280, 36);
+  CTX.strokeStyle = '#8888aa';
+  CTX.lineWidth = 2;
+  CTX.strokeRect(W/2 - 140, 330, 280, 36);
+  drawTextOutline('ESC - MENU', W/2, 338, 10, '#8888aa', '#000');
+}
+
+function updateGameOver() {
+  if (wasPressed('enter') || wasPressed(' ')) {
+    gameState = STATE.PLAYING;
+    initGame();
+    return;
+  }
+  if (wasPressed('escape')) {
+    gameState = STATE.MENU;
+    return;
+  }
+}
+
+// ============================================================
+//  LOJA DE SKINS
+// ============================================================
+function renderShop() {
+  const t = Date.now() / 1000;
+
+  // Fundo
+  const grad = CTX.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#0f0f2a');
+  grad.addColorStop(1, '#1a1a3a');
+  CTX.fillStyle = grad;
+  CTX.fillRect(0, 0, W, H);
+
+  // Título
+  drawTextOutline('LOJA DE SKINS', W/2, 15, 18, '#ffaa00', '#000');
+
+  // Moedas do jogador
+  drawTextOutline('MOEDAS: ' + save.coins, W/2, 45, 10, '#ffdd44', '#000');
+
+  // Tabs
+  const tabColors = ['#44ff88', '#ff8844'];
+  const tabNames = ['CORES', 'ACESSÓRIOS'];
+  for (let i = 0; i < 2; i++) {
+    const tx = W/2 - 140 + i * 150;
+    const sel = shopTab === i;
+    CTX.fillStyle = sel ? tabColors[i] + '33' : '#ffffff11';
+    CTX.fillRect(tx, 68, 130, 24);
+    CTX.strokeStyle = sel ? tabColors[i] : '#555';
+    CTX.lineWidth = sel ? 2 : 1;
+    CTX.strokeRect(tx, 68, 130, 24);
+    drawTextOutline(tabNames[i], tx + 65, 72, 8, sel ? tabColors[i] : '#888', '#000');
+  }
+
+  // Controle de tab
+  drawText('Q/E = Mudar Aba', W/2 - 55, H - 18, 7, '#556677');
+
+  if (shopTab === 0) {
+    // === CORES ===
+    let row = 0;
+    for (let i = 0; i < SKIN_ORDER.length; i++) {
+      const key = SKIN_ORDER[i];
+      const def = SKIN_DEFS[key];
+      const owned = save.purchased.includes(key);
+      const equipped = save.equipped === key;
+
+      const ix = 60 + (i % 3) * 240;
+      const iy = 105 + Math.floor(i / 3) * 130;
+
+      // Card background
+      CTX.fillStyle = equipped ? '#44ff8822' : '#ffffff0a';
+      CTX.fillRect(ix, iy, 210, 110);
+      CTX.strokeStyle = equipped ? '#44ff88' : '#444';
+      CTX.lineWidth = equipped ? 2 : 1;
+      CTX.strokeRect(ix, iy, 210, 110);
+
+      // Mini alien preview
+      const previewColors = {
+        skin: def.skin, skinDk: def.skinDk, antenna: def.antenna,
+        eyeW: '#fff', eyeP: '#111', mouth: '#225533', belt: '#888'
+      };
+      const previewFrame = Math.floor(t * 3) % 2;
+      drawAlien(ix + 15, iy + 25, previewFrame, false, previewColors, null);
+
+      // Info
+      drawText(def.name, ix + 70, iy + 12, 9, '#ffffff');
+
+      if (equipped) {
+        drawText('EQUIPADO', ix + 70, iy + 35, 8, '#44ff88');
+      } else if (owned) {
+        drawText('[' + (i+1) + '] EQUIPAR', ix + 70, iy + 35, 8, '#88aaff');
+      } else {
+        drawText('Preço: ' + def.price, ix + 70, iy + 35, 8, '#ffcc00');
+        drawText('[' + (i+1) + '] COMPRAR', ix + 70, iy + 55, 7, '#ff8844');
+      }
+
+      if (equipped) {
+        drawText('★', ix + 190, iy + 8, 12, '#44ff88');
+      }
+    }
+  } else {
+    // === ACESSÓRIOS ===
+    for (let i = 0; i < ACC_ORDER.length; i++) {
+      const key = ACC_ORDER[i];
+      const def = ACC_DEFS[key];
+      const owned = (save.purchasedAcc || []).includes(key);
+      const equipped = save.accessory === key;
+
+      const ix = 60 + i * 240;
+      const iy = 110;
+
+      // Card background
+      CTX.fillStyle = equipped ? '#ff884422' : '#ffffff0a';
+      CTX.fillRect(ix, iy, 210, 140);
+      CTX.strokeStyle = equipped ? '#ff8844' : '#444';
+      CTX.lineWidth = equipped ? 2 : 1;
+      CTX.strokeRect(ix, iy, 210, 140);
+
+      // Mini alien preview com acessório
+      const colors = getAlienColors();
+      const previewFrame = Math.floor(t * 3) % 2;
+      drawAlien(ix + 15, iy + 35, previewFrame, false, colors, key);
+
+      // Info
+      drawText(def.name, ix + 70, iy + 15, 10, '#ffffff');
+
+      if (equipped) {
+        drawText('EQUIPADO', ix + 70, iy + 42, 8, '#ff8844');
+        drawText('[' + (i+1) + '] REMOVER', ix + 70, iy + 65, 7, '#aaaaaa');
+      } else if (owned) {
+        drawText('[' + (i+1) + '] EQUIPAR', ix + 70, iy + 42, 8, '#88aaff');
+      } else {
+        drawText('Preço: ' + def.price, ix + 70, iy + 42, 8, '#ffcc00');
+        drawText('[' + (i+1) + '] COMPRAR', ix + 70, iy + 65, 7, '#ff8844');
+      }
+    }
+  }
+
+  // Voltar
+  CTX.fillStyle = 'rgba(136, 136, 170, 0.12)';
+  CTX.fillRect(W/2 - 100, H - 50, 200, 30);
+  CTX.strokeStyle = '#8888aa';
+  CTX.lineWidth = 1;
+  CTX.strokeRect(W/2 - 100, H - 50, 200, 30);
+  drawTextOutline('ESC - VOLTAR', W/2, H - 46, 9, '#8888aa', '#000');
+}
+
+function updateShop() {
+  if (wasPressed('escape')) {
+    gameState = STATE.MENU;
+    return;
+  }
+
+  // Trocar aba
+  if (wasPressed('q') || wasPressed('e')) {
+    shopTab = 1 - shopTab;
+  }
+
+  if (shopTab === 0) {
+    // Comprar/equipar cores
+    for (let i = 0; i < SKIN_ORDER.length; i++) {
+      if (wasPressed('' + (i + 1))) {
+        const key = SKIN_ORDER[i];
+        const def = SKIN_DEFS[key];
+        if (save.purchased.includes(key)) {
+          // Equipar
+          save.equipped = key;
+          writeSave();
+        } else if (save.coins >= def.price) {
+          // Comprar
+          save.coins -= def.price;
+          save.purchased.push(key);
+          save.equipped = key;
+          writeSave();
+        }
+      }
+    }
+  } else {
+    // Comprar/equipar acessórios
+    if (!save.purchasedAcc) save.purchasedAcc = [];
+    for (let i = 0; i < ACC_ORDER.length; i++) {
+      if (wasPressed('' + (i + 1))) {
+        const key = ACC_ORDER[i];
+        const def = ACC_DEFS[key];
+        if (save.purchasedAcc.includes(key)) {
+          // Equipar ou remover
+          if (save.accessory === key) {
+            save.accessory = null;
+          } else {
+            save.accessory = key;
+          }
+          writeSave();
+        } else if (save.coins >= def.price) {
+          // Comprar
+          save.coins -= def.price;
+          save.purchasedAcc.push(key);
+          save.accessory = key;
+          writeSave();
+        }
+      }
+    }
+  }
+}
+
+// ============================================================
+//  GAME LOOP PRINCIPAL
+// ============================================================
+let lastTime = 0;
+
+function gameLoop(timestamp) {
+  const dt = Math.min(0.05, (timestamp - lastTime) / 1000);
+  lastTime = timestamp;
+
+  switch (gameState) {
+    case STATE.MENU:
+      updateMenu();
+      renderMenu();
+      break;
+
+    case STATE.PLAYING:
+      updateGame(dt);
+      renderGame();
+      break;
+
+    case STATE.GAMEOVER:
+      renderGame(); // Manter cena de fundo
+      renderGameOver();
+      updateGameOver();
+      break;
+
+    case STATE.SHOP:
+      updateShop();
+      renderShop();
+      break;
+  }
+
+  clearJustPressed();
+  requestAnimationFrame(gameLoop);
+}
+
+// ============================================================
+//  INICIALIZAÇÃO
+// ============================================================
+// Garantir dados salvos completos
+if (!save.purchasedAcc) { save.purchasedAcc = []; writeSave(); }
+if (!save.accessory) { save.accessory = null; }
+
+generateBuildings();
+generateStars();
+
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
